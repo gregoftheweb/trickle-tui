@@ -201,13 +201,21 @@ fn try_launch_interactive(
     let _ = terminal.clear();
 
     match result {
-        Ok(status) => {
+        Ok((status, stats)) => {
             let code = status
                 .code()
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "killed by signal".to_string());
+            let totals = match stats {
+                Some(s) => format!(
+                    " -- sent {}, received {}",
+                    ui::fmt_bytes(s.send_total),
+                    ui::fmt_bytes(s.recv_total)
+                ),
+                None => String::new(),
+            };
             app.launcher.status = Some(format!(
-                "{command_label} exited ({code}) after {}",
+                "{command_label} exited ({code}) after {}{totals}",
                 fmt_elapsed(elapsed)
             ));
         }

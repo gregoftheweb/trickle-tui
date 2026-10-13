@@ -141,6 +141,17 @@ fn fmt_rate(bytes_per_sec: u32) -> String {
     }
 }
 
+/// Formats an absolute byte count (a session total, not a rate).
+pub(crate) fn fmt_bytes(bytes: u32) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 fn fmt_duration(d: std::time::Duration) -> String {
     let secs = d.as_secs();
     format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
@@ -186,17 +197,19 @@ fn draw_running(frame: &mut Frame, app: &App) {
 
     let send_title = match running.last_stats {
         Some(s) => format!(
-            "Upload -- {} (limit {})",
+            "Upload -- {} (limit {}, total {})",
             fmt_rate(s.send_rate),
-            fmt_rate(s.send_limit)
+            fmt_rate(s.send_limit),
+            fmt_bytes(s.send_total)
         ),
         None => "Upload".to_string(),
     };
     let recv_title = match running.last_stats {
         Some(s) => format!(
-            "Download -- {} (limit {})",
+            "Download -- {} (limit {}, total {})",
             fmt_rate(s.recv_rate),
-            fmt_rate(s.recv_limit)
+            fmt_rate(s.recv_limit),
+            fmt_bytes(s.recv_total)
         ),
         None => "Download".to_string(),
     };

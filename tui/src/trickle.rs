@@ -10,6 +10,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Resolves trickle-overload.so's absolute path, sitting alongside
@@ -42,8 +44,13 @@ fn resolve_overload_path(trickle_path: &str) -> std::io::Result<PathBuf> {
 pub struct Stats {
     pub send_limit: u32,
     pub send_rate: u32,
+    /// Cumulative bytes sent since the wrapped process started (not since
+    /// the last poll) -- see trickle-overload.c's control-socket protocol
+    /// doc comment.
+    pub send_total: u32,
     pub recv_limit: u32,
     pub recv_rate: u32,
+    pub recv_total: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,16 +128,23 @@ impl Session {
     /// until it exits. For genuinely interactive programs (claude, codex, a
     /// shell) rather than fire-and-forget/background ones -- those can't
     /// share a terminal with a live dashboard at the same time, so there's
-    /// no control-socket connection and no live stats here. The caller is
-    /// responsible for getting its own TUI out of the way (raw mode /
-    /// alternate screen) before calling this, and restoring it after.
+    /// no live view here. The caller is responsible for getting its own TUI
+    /// out of the way (raw mode / alternate screen) before calling this,
+    /// and restoring it after.
+    ///
+    /// Still connects to the control socket, just invisibly, in a
+    /// background thread polling GET -- not for a live display, but so the
+    /// returned cumulative totals (the last reading captured before the
+    /// socket goes away) can be shown as a one-line summary once the child
+    /// exits. `None` if the process never got far enough to open the
+    /// socket, or exited before the first successful poll.
     pub fn launch_interactive(
         trickle_path: &str,
         upload_bps: u32,
         download_bps: u32,
         command: &str,
         args: &[String],
-    ) -> std::io::Result<ExitStatus> {
+    ) -> std::io::Result<(ExitStatus, Option<Stats>)> {
         let overload_path = resolve_overload_path(trickle_path)?;
 
         let mut cmd = Command::new(trickle_path);
@@ -146,7 +160,26 @@ impl Session {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
 
-        cmd.spawn()?.wait()
+        let mut child = cmd.spawn()?;
+        let pid = child.id();
+
+        // Lets the poller stop waiting for the socket to ever appear as
+        // soon as we know the process is gone, rather than sitting out the
+        // full SOCKET_WAIT_TIMEOUT on something that failed instantly (a
+        // bad command, a typo) -- the GET-polling loop below this doesn't
+        // need the same treatment, since a torn-down socket already fails
+        // those reads/writes directly.
+        let child_exited = Arc::new(AtomicBool::new(false));
+        let poller = {
+            let child_exited = Arc::clone(&child_exited);
+            std::thread::spawn(move || poll_session_stats(pid, child_exited))
+        };
+
+        let status = child.wait()?;
+        child_exited.store(true, Ordering::Relaxed);
+
+        let final_stats = poller.join().unwrap_or(None);
+        Ok((status, final_stats))
     }
 
     /// True once the wrapped process has exited.
@@ -192,30 +225,7 @@ impl Session {
         let stream = self.control.as_mut().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotConnected, "not connected")
         })?;
-
-        stream.write_all(line.as_bytes())?;
-        stream.write_all(b"\n")?;
-        stream.flush()?;
-
-        // The protocol's responses are all terminated by a line that's
-        // either "OK" or starts with "ERR"; GET sends two data lines first.
-        let mut reader = BufReader::new(stream.try_clone()?);
-        let mut out = String::new();
-        loop {
-            let mut buf = String::new();
-            let n = reader.read_line(&mut buf)?;
-            if n == 0 {
-                break; // EOF
-            }
-            let trimmed = buf.trim_end();
-            let is_terminal = trimmed == "OK" || trimmed.starts_with("ERR");
-            out.push_str(trimmed);
-            out.push('\n');
-            if is_terminal {
-                break;
-            }
-        }
-        Ok(out)
+        control_send_line(stream, line)
     }
 
     pub fn get_stats(&mut self) -> std::io::Result<Stats> {
@@ -242,11 +252,83 @@ impl Session {
     }
 }
 
+/// Sends one line over an already-connected control socket and reads back
+/// its response. The protocol's responses are all terminated by a line
+/// that's either "OK" or starts with "ERR"; GET sends two data lines first.
+fn control_send_line(stream: &mut UnixStream, line: &str) -> std::io::Result<String> {
+    stream.write_all(line.as_bytes())?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut out = String::new();
+    loop {
+        let mut buf = String::new();
+        let n = reader.read_line(&mut buf)?;
+        if n == 0 {
+            break; // EOF
+        }
+        let trimmed = buf.trim_end();
+        let is_terminal = trimmed == "OK" || trimmed.starts_with("ERR");
+        out.push_str(trimmed);
+        out.push('\n');
+        if is_terminal {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+fn control_get_stats(stream: &mut UnixStream) -> std::io::Result<Stats> {
+    let resp = control_send_line(stream, "GET")?;
+    parse_stats(&resp).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed GET response")
+    })
+}
+
+/// Background-thread body for Session::launch_interactive: connects to
+/// pid's control socket once it appears, then polls GET until a request
+/// fails (the socket's gone -- the process exited and its atexit handler
+/// unlinked it) or `exited` is observed set first (the process never made
+/// it far enough to open the socket at all). Returns the last Stats
+/// successfully parsed, if any -- cumulative totals only climb, so that's
+/// effectively the session total, just as of up to one poll interval
+/// before the process actually exited.
+fn poll_session_stats(pid: u32, exited: Arc<AtomicBool>) -> Option<Stats> {
+    const STATS_POLL_INTERVAL: Duration = Duration::from_millis(500);
+    let socket_path = PathBuf::from(format!("/tmp/trickle/{pid}.sock"));
+    let start = Instant::now();
+
+    let mut stream = loop {
+        if socket_path.exists() {
+            if let Ok(s) = UnixStream::connect(&socket_path) {
+                break s;
+            }
+        }
+        if exited.load(Ordering::Relaxed) || start.elapsed() > SOCKET_WAIT_TIMEOUT {
+            return None;
+        }
+        std::thread::sleep(SOCKET_POLL_INTERVAL);
+    };
+
+    let mut last_stats = None;
+    loop {
+        match control_get_stats(&mut stream) {
+            Ok(stats) => last_stats = Some(stats),
+            Err(_) => break,
+        }
+        std::thread::sleep(STATS_POLL_INTERVAL);
+    }
+    last_stats
+}
+
 fn parse_stats(resp: &str) -> Option<Stats> {
     let mut send_limit = None;
     let mut send_rate = None;
+    let mut send_total = None;
     let mut recv_limit = None;
     let mut recv_rate = None;
+    let mut recv_total = None;
 
     for line in resp.lines() {
         let mut parts = line.split_whitespace();
@@ -254,10 +336,12 @@ fn parse_stats(resp: &str) -> Option<Stats> {
             Some("SEND") => {
                 send_limit = parts.next()?.parse().ok();
                 send_rate = parts.next()?.parse().ok();
+                send_total = parts.next()?.parse().ok();
             }
             Some("RECV") => {
                 recv_limit = parts.next()?.parse().ok();
                 recv_rate = parts.next()?.parse().ok();
+                recv_total = parts.next()?.parse().ok();
             }
             _ => {}
         }
@@ -266,8 +350,10 @@ fn parse_stats(resp: &str) -> Option<Stats> {
     Some(Stats {
         send_limit: send_limit?,
         send_rate: send_rate?,
+        send_total: send_total?,
         recv_limit: recv_limit?,
         recv_rate: recv_rate?,
+        recv_total: recv_total?,
     })
 }
 
@@ -277,12 +363,14 @@ mod tests {
 
     #[test]
     fn parses_a_well_formed_get_response() {
-        let resp = "SEND 51200 78526\nRECV 10240 231726\nOK\n";
+        let resp = "SEND 51200 78526 9043200\nRECV 10240 231726 55924736\nOK\n";
         let stats = parse_stats(resp).expect("should parse");
         assert_eq!(stats.send_limit, 51200);
         assert_eq!(stats.send_rate, 78526);
+        assert_eq!(stats.send_total, 9043200);
         assert_eq!(stats.recv_limit, 10240);
         assert_eq!(stats.recv_rate, 231726);
+        assert_eq!(stats.recv_total, 55924736);
     }
 
     #[test]
@@ -332,5 +420,33 @@ mod tests {
         assert_eq!(stats.recv_limit, 20 * 1024);
 
         session.kill().expect("kill failed");
+    }
+
+    /// Exercises launch_interactive's full path -- spawn, background
+    /// control-socket polling, blocking wait, final totals -- against a
+    /// real process. Same network-access caveat as the test above: needs a
+    /// command that actually makes an intercepted call so trickle_init()
+    /// (and so the control socket) ever fires. Not run by default: `cargo
+    /// test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn launches_interactively_and_reports_totals() {
+        let (status, stats) = Session::launch_interactive(
+            "../trickle",
+            50 * 1024,
+            100 * 1024,
+            "curl",
+            &[
+                "-s".to_string(),
+                "-o".to_string(),
+                "/dev/null".to_string(),
+                "https://speed.cloudflare.com/__down?bytes=3000000".to_string(),
+            ],
+        )
+        .expect("failed to launch");
+
+        assert!(status.success());
+        let stats = stats.expect("expected final stats to have been captured");
+        assert!(stats.recv_total > 0, "expected some bytes to have been received");
     }
 }

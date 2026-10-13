@@ -187,9 +187,15 @@ void                   safe_printv(int, const char *, ...);
  * /tmp/trickle/<pid>.sock. One client connection at a time, kept open
  * across multiple commands so a TUI can poll live stats cheaply:
  *
- *   GET                      -> "SEND <lim> <rate>\nRECV <lim> <rate>\nOK\n"
+ *   GET                      -> "SEND <lim> <rate> <total>\nRECV <lim> <rate> <total>\nOK\n"
  *   SET SEND <bytes-per-sec> -> "OK\n" or "ERR <reason>\n"
  *   SET RECV <bytes-per-sec> -> "OK\n" or "ERR <reason>\n"
+ *
+ * <total> is the cumulative byte count for that direction since the
+ * process started (struct bwstat_data's `bytes`, which -- unlike
+ * `winbytes` -- is never reset by bwstat_update()'s sliding-window
+ * logic), letting a controller report a session total without having to
+ * numerically integrate sampled rates itself.
  *
  * There's no dedicated "unlimited" value -- that's the controller's job:
  * bwstat_getdelay() only throttles once the observed rate exceeds the
@@ -289,11 +295,13 @@ control_handle_command(int fd, char *line)
 	if (strcmp(cmd, "GET") == 0) {
 		trickle_lock();
 		snprintf(reply, sizeof(reply),
-		    "SEND %u %u\nRECV %u %u\nOK\n",
+		    "SEND %u %u %u\nRECV %u %u %u\nOK\n",
 		    lim[TRICKLE_SEND],
 		    bwstat_gettot()->data[TRICKLE_SEND].winrate,
+		    bwstat_gettot()->data[TRICKLE_SEND].bytes,
 		    lim[TRICKLE_RECV],
-		    bwstat_gettot()->data[TRICKLE_RECV].winrate);
+		    bwstat_gettot()->data[TRICKLE_RECV].winrate,
+		    bwstat_gettot()->data[TRICKLE_RECV].bytes);
 		trickle_unlock();
 		control_send(fd, reply);
 		return;

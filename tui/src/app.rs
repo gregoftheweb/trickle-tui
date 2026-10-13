@@ -18,6 +18,7 @@ pub enum LauncherField {
     Command,
     UploadLimit,
     DownloadLimit,
+    Interactive,
     Timed,
     DurationMinutes,
 }
@@ -28,7 +29,8 @@ impl LauncherField {
         match self {
             Command => UploadLimit,
             UploadLimit => DownloadLimit,
-            DownloadLimit => Timed,
+            DownloadLimit => Interactive,
+            Interactive => Timed,
             Timed => {
                 // DurationMinutes only makes sense when Timed is on; the UI
                 // skips it when toggled off, handled in App::tab().
@@ -44,7 +46,8 @@ impl LauncherField {
             Command => DurationMinutes,
             UploadLimit => Command,
             DownloadLimit => UploadLimit,
-            Timed => DownloadLimit,
+            Interactive => DownloadLimit,
+            Timed => Interactive,
             DurationMinutes => Timed,
         }
     }
@@ -54,10 +57,17 @@ pub struct LauncherForm {
     pub command: String,
     pub upload_limit_kbps: String,
     pub download_limit_kbps: String,
+    /// Interactive programs (claude, codex, a shell) need the real
+    /// terminal -- stdin to read from, stdout/stderr to write to -- so they
+    /// get full control of it for their lifetime instead of a live
+    /// dashboard, which can't coexist with that. Off by default: it's the
+    /// right choice for fire-and-forget/background commands and GUI apps.
+    pub interactive: bool,
     pub timed: bool,
     pub duration_minutes: String,
     pub focus: LauncherField,
     pub error: Option<String>,
+    pub status: Option<String>,
 }
 
 impl Default for LauncherForm {
@@ -66,10 +76,12 @@ impl Default for LauncherForm {
             command: String::new(),
             upload_limit_kbps: "50".to_string(),
             download_limit_kbps: "200".to_string(),
+            interactive: false,
             timed: false,
             duration_minutes: "30".to_string(),
             focus: LauncherField::Command,
             error: None,
+            status: None,
         }
     }
 }
@@ -81,11 +93,12 @@ impl LauncherForm {
             LauncherField::UploadLimit => &mut self.upload_limit_kbps,
             LauncherField::DownloadLimit => &mut self.download_limit_kbps,
             LauncherField::DurationMinutes => &mut self.duration_minutes,
-            // Timed is a bool toggle, not a text field; nothing to edit.
-            LauncherField::Timed => {
+            // Timed and Interactive are bool toggles, not text fields;
+            // nothing to edit.
+            LauncherField::Timed | LauncherField::Interactive => {
                 // Safe dummy: Command is always a valid text target, and
                 // callers only push/pop chars, which is a no-op UX-wise if
-                // this ever got hit (it won't -- char input skips Timed).
+                // this ever got hit (it won't -- char input skips these).
                 &mut self.command
             }
         }

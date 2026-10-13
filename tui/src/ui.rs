@@ -32,9 +32,10 @@ fn draw_launcher(frame: &mut Frame, app: &App) {
             Constraint::Length(3), // command
             Constraint::Length(3), // upload
             Constraint::Length(3), // download
+            Constraint::Length(3), // interactive toggle
             Constraint::Length(3), // timed toggle
             Constraint::Length(3), // duration
-            Constraint::Length(2), // error
+            Constraint::Length(2), // error / status
             Constraint::Min(0),    // help
         ])
         .split(area);
@@ -75,11 +76,19 @@ fn draw_launcher(frame: &mut Frame, app: &App) {
     );
     frame.render_widget(
         labeled_value(
+            "Interactive? (space to toggle -- on for claude/codex/a shell)",
+            if f.interactive { "yes (hands over the terminal, no live view)" } else { "no (background/GUI app, shows live dashboard)" },
+            f.focus == LauncherField::Interactive,
+        ),
+        chunks[4],
+    );
+    frame.render_widget(
+        labeled_value(
             "Timed? (space to toggle)",
             if f.timed { "yes" } else { "no (permanent)" },
             f.focus == LauncherField::Timed,
         ),
-        chunks[4],
+        chunks[5],
     );
     if f.timed {
         frame.render_widget(
@@ -88,23 +97,28 @@ fn draw_launcher(frame: &mut Frame, app: &App) {
                 &f.duration_minutes,
                 f.focus == LauncherField::DurationMinutes,
             ),
-            chunks[5],
+            chunks[6],
         );
     }
 
     if let Some(err) = &f.error {
         frame.render_widget(
             Paragraph::new(err.as_str()).style(Style::default().fg(Color::Red)),
-            chunks[6],
+            chunks[7],
+        );
+    } else if let Some(status) = &f.status {
+        frame.render_widget(
+            Paragraph::new(status.as_str()).style(Style::default().fg(Color::Green)),
+            chunks[7],
         );
     }
 
     frame.render_widget(
         Paragraph::new(
-            "Tab/Shift+Tab: move  Space: toggle timed  Enter: launch  Esc/Ctrl+C: quit",
+            "Tab/Shift+Tab: move  Space: toggle  Enter: launch  Esc/Ctrl+C: quit",
         )
         .style(Style::default().fg(Color::DarkGray)),
-        chunks[7],
+        chunks[8],
     );
 }
 

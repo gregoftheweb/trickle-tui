@@ -9,8 +9,34 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
+
+/// Resolves trickle-overload.so's absolute path, sitting alongside
+/// trickle_path, rather than relying on trickle's own CWD-relative search
+/// (which would otherwise require running the wrapped app from the
+/// repo/install directory -- wrong for apps that care about their own
+/// working directory, which is most of them). Requires the
+/// TRICKLE_OVERLOAD_PATH support added to trickle.c alongside this.
+fn resolve_overload_path(trickle_path: &str) -> std::io::Result<PathBuf> {
+    let trickle_abs = std::fs::canonicalize(trickle_path)?;
+    let overload_path = trickle_abs
+        .parent()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "couldn't determine trickle's directory",
+            )
+        })?
+        .join("trickle-overload.so");
+    if !overload_path.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("trickle-overload.so not found at {}", overload_path.display()),
+        ));
+    }
+    Ok(overload_path)
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct Stats {
@@ -63,28 +89,7 @@ impl Session {
         command: &str,
         args: &[String],
     ) -> std::io::Result<Self> {
-        // Resolve trickle-overload.so explicitly rather than relying on
-        // trickle's own CWD-relative search, which would otherwise require
-        // running the wrapped app from the repo/install directory -- wrong
-        // for apps that care about their own working directory (most of
-        // them). Requires the TRICKLE_OVERLOAD_PATH support added to
-        // trickle.c alongside this.
-        let trickle_abs = std::fs::canonicalize(trickle_path)?;
-        let overload_path = trickle_abs
-            .parent()
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "couldn't determine trickle's directory",
-                )
-            })?
-            .join("trickle-overload.so");
-        if !overload_path.exists() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("trickle-overload.so not found at {}", overload_path.display()),
-            ));
-        }
+        let overload_path = resolve_overload_path(trickle_path)?;
 
         let mut cmd = Command::new(trickle_path);
         cmd.env("TRICKLE_OVERLOAD_PATH", &overload_path)
@@ -109,6 +114,39 @@ impl Session {
             socket_path,
             control: None,
         })
+    }
+
+    /// Launches `command` under standalone trickle with its stdin/stdout/
+    /// stderr connected straight to ours (the caller's terminal), and blocks
+    /// until it exits. For genuinely interactive programs (claude, codex, a
+    /// shell) rather than fire-and-forget/background ones -- those can't
+    /// share a terminal with a live dashboard at the same time, so there's
+    /// no control-socket connection and no live stats here. The caller is
+    /// responsible for getting its own TUI out of the way (raw mode /
+    /// alternate screen) before calling this, and restoring it after.
+    pub fn launch_interactive(
+        trickle_path: &str,
+        upload_bps: u32,
+        download_bps: u32,
+        command: &str,
+        args: &[String],
+    ) -> std::io::Result<ExitStatus> {
+        let overload_path = resolve_overload_path(trickle_path)?;
+
+        let mut cmd = Command::new(trickle_path);
+        cmd.env("TRICKLE_OVERLOAD_PATH", &overload_path)
+            .arg("-s")
+            .arg("-u")
+            .arg((upload_bps / 1024).max(1).to_string())
+            .arg("-d")
+            .arg((download_bps / 1024).max(1).to_string())
+            .arg(command)
+            .args(args)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+
+        cmd.spawn()?.wait()
     }
 
     /// True once the wrapped process has exited.

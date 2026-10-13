@@ -45,7 +45,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mut App
         if event::poll(EVENT_POLL_TIMEOUT)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    handle_key(app, key.code, key.modifiers);
+                    handle_key(app, key.code, key.modifiers, terminal);
                 }
             }
         }
@@ -61,19 +61,28 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mut App
     }
 }
 
-fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+fn handle_key(
+    app: &mut App,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+) {
     if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
         app.should_quit = true;
         return;
     }
 
     match app.screen {
-        Screen::Launcher => handle_launcher_key(app, code),
+        Screen::Launcher => handle_launcher_key(app, code, terminal),
         Screen::Running => handle_running_key(app, code),
     }
 }
 
-fn handle_launcher_key(app: &mut App, code: KeyCode) {
+fn handle_launcher_key(
+    app: &mut App,
+    code: KeyCode,
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+) {
     let form = &mut app.launcher;
     match code {
         KeyCode::Esc => app.should_quit = true,
@@ -82,18 +91,25 @@ fn handle_launcher_key(app: &mut App, code: KeyCode) {
         KeyCode::Char(' ') if form.focus == LauncherField::Timed => {
             form.timed = !form.timed;
         }
-        KeyCode::Char(c) if form.focus != LauncherField::Timed => {
+        KeyCode::Char(' ') if form.focus == LauncherField::Interactive => {
+            form.interactive = !form.interactive;
+        }
+        KeyCode::Char(c)
+            if form.focus != LauncherField::Timed && form.focus != LauncherField::Interactive =>
+        {
             form.focused_field_mut().push(c);
         }
-        KeyCode::Backspace if form.focus != LauncherField::Timed => {
+        KeyCode::Backspace
+            if form.focus != LauncherField::Timed && form.focus != LauncherField::Interactive =>
+        {
             form.focused_field_mut().pop();
         }
-        KeyCode::Enter => try_launch(app),
+        KeyCode::Enter => try_launch(app, terminal),
         _ => {}
     }
 }
 
-fn try_launch(app: &mut App) {
+fn try_launch(app: &mut App, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) {
     let Some((upload_bps, download_bps, duration)) = app.launcher.validate() else {
         return;
     };
@@ -101,14 +117,30 @@ fn try_launch(app: &mut App) {
     // Split "command arg1 arg2" naively on whitespace. Good enough for v1;
     // doesn't handle quoted args with spaces.
     let mut parts = app.launcher.command.split_whitespace();
-    let Some(command) = parts.next() else {
+    let Some(command) = parts.next().map(String::from) else {
         app.launcher.error = Some("Enter a command to launch".to_string());
         return;
     };
     let args: Vec<String> = parts.map(String::from).collect();
     let command_label = app.launcher.command.clone();
 
-    match Session::launch(&app.trickle_path, upload_bps, download_bps, command, &args) {
+    app.launcher.error = None;
+    app.launcher.status = None;
+
+    if app.launcher.interactive {
+        try_launch_interactive(
+            app,
+            terminal,
+            upload_bps,
+            download_bps,
+            &command,
+            &args,
+            command_label,
+        );
+        return;
+    }
+
+    match Session::launch(&app.trickle_path, upload_bps, download_bps, &command, &args) {
         Ok(mut session) => {
             // v1 simplification: this blocks the UI thread briefly (usually
             // under a second -- trickle_control_start() runs as soon as the
@@ -129,6 +161,68 @@ fn try_launch(app: &mut App) {
         Err(e) => {
             app.launcher.error = Some(format!("Failed to launch: {e}"));
         }
+    }
+}
+
+/// Interactive programs (claude, codex, a shell) need the real terminal, and
+/// can't share it with a live dashboard at the same time -- so this hands
+/// our terminal to the child entirely: leaves the alternate screen and raw
+/// mode, blocks until the child exits, then takes the screen back. No live
+/// stats or in-flight limit adjustment during this -- the bandwidth shaping
+/// itself is still fully in effect regardless, just not visible here.
+fn try_launch_interactive(
+    app: &mut App,
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    upload_bps: u32,
+    download_bps: u32,
+    command: &str,
+    args: &[String],
+    command_label: String,
+) {
+    if let Err(e) = disable_raw_mode() {
+        app.launcher.error = Some(format!("Couldn't hand off terminal: {e}"));
+        return;
+    }
+    if let Err(e) = execute!(terminal.backend_mut(), LeaveAlternateScreen) {
+        let _ = enable_raw_mode();
+        app.launcher.error = Some(format!("Couldn't hand off terminal: {e}"));
+        return;
+    }
+
+    let start = Instant::now();
+    let result =
+        Session::launch_interactive(&app.trickle_path, upload_bps, download_bps, command, args);
+    let elapsed = start.elapsed();
+
+    // Always try to restore our own screen, whether the launch succeeded or
+    // not, so the TUI isn't left stranded in normal-terminal mode.
+    let _ = execute!(terminal.backend_mut(), EnterAlternateScreen);
+    let _ = enable_raw_mode();
+    let _ = terminal.clear();
+
+    match result {
+        Ok(status) => {
+            let code = status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "killed by signal".to_string());
+            app.launcher.status = Some(format!(
+                "{command_label} exited ({code}) after {}",
+                fmt_elapsed(elapsed)
+            ));
+        }
+        Err(e) => {
+            app.launcher.error = Some(format!("Failed to launch {command_label}: {e}"));
+        }
+    }
+}
+
+fn fmt_elapsed(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs >= 60 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
     }
 }
 

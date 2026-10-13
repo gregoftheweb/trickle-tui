@@ -15,10 +15,10 @@ pub enum Screen {
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum LauncherField {
+    Interactive,
     Command,
     UploadLimit,
     DownloadLimit,
-    Interactive,
     Timed,
     DurationMinutes,
 }
@@ -27,27 +27,27 @@ impl LauncherField {
     fn next(self) -> Self {
         use LauncherField::*;
         match self {
+            Interactive => Command,
             Command => UploadLimit,
             UploadLimit => DownloadLimit,
-            DownloadLimit => Interactive,
-            Interactive => Timed,
+            DownloadLimit => Timed,
             Timed => {
                 // DurationMinutes only makes sense when Timed is on; the UI
                 // skips it when toggled off, handled in App::tab().
                 DurationMinutes
             }
-            DurationMinutes => Command,
+            DurationMinutes => Interactive,
         }
     }
 
     fn prev(self) -> Self {
         use LauncherField::*;
         match self {
-            Command => DurationMinutes,
+            Interactive => DurationMinutes,
+            Command => Interactive,
             UploadLimit => Command,
             DownloadLimit => UploadLimit,
-            Interactive => DownloadLimit,
-            Timed => Interactive,
+            Timed => DownloadLimit,
             DurationMinutes => Timed,
         }
     }
@@ -79,7 +79,7 @@ impl Default for LauncherForm {
             interactive: false,
             timed: false,
             duration_minutes: "30".to_string(),
-            focus: LauncherField::Command,
+            focus: LauncherField::Interactive,
             error: None,
             status: None,
         }

@@ -29,10 +29,10 @@ fn draw_launcher(frame: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // title
+            Constraint::Length(3), // interactive toggle
             Constraint::Length(3), // command
             Constraint::Length(3), // upload
             Constraint::Length(3), // download
-            Constraint::Length(3), // interactive toggle
             Constraint::Length(3), // timed toggle
             Constraint::Length(3), // duration
             Constraint::Length(2), // error / status
@@ -52,11 +52,23 @@ fn draw_launcher(frame: &mut Frame, app: &App) {
     let f = &app.launcher;
     frame.render_widget(
         labeled_value(
+            "Launch as? (space to toggle)",
+            if f.interactive {
+                "open an app (hands over the terminal, e.g. claude/codex)"
+            } else {
+                "run a hidden process (background dashboard, e.g. curl/vivaldi)"
+            },
+            f.focus == LauncherField::Interactive,
+        ),
+        chunks[1],
+    );
+    frame.render_widget(
+        labeled_value(
             "Command (e.g. `claude`, `codex`, `vivaldi`)",
             &f.command,
             f.focus == LauncherField::Command,
         ),
-        chunks[1],
+        chunks[2],
     );
     frame.render_widget(
         labeled_value(
@@ -64,21 +76,13 @@ fn draw_launcher(frame: &mut Frame, app: &App) {
             &f.upload_limit_kbps,
             f.focus == LauncherField::UploadLimit,
         ),
-        chunks[2],
+        chunks[3],
     );
     frame.render_widget(
         labeled_value(
             "Download limit (KB/s)",
             &f.download_limit_kbps,
             f.focus == LauncherField::DownloadLimit,
-        ),
-        chunks[3],
-    );
-    frame.render_widget(
-        labeled_value(
-            "Interactive? (space to toggle -- on for claude/codex/a shell)",
-            if f.interactive { "yes (hands over the terminal, no live view)" } else { "no (background/GUI app, shows live dashboard)" },
-            f.focus == LauncherField::Interactive,
         ),
         chunks[4],
     );

@@ -108,13 +108,27 @@ main(int argc, char **argv)
 	if (argc == 0)
 		usage();
 
-	for (pathp = trypaths; *pathp != NULL; pathp++)
-		if (lstat(*pathp, &sb) == 0)
-			break;
+	/*
+	 * TRICKLE_OVERLOAD_PATH lets a caller that doesn't control (or
+	 * doesn't want to rely on) the wrapped process's own working
+	 * directory -- e.g. trickle-tui, spawning arbitrary apps that each
+	 * need their own real CWD -- point directly at trickle-overload.so
+	 * instead of depending on the CWD-relative/installed-libdir search
+	 * below.
+	 */
+	if ((path = getenv("TRICKLE_OVERLOAD_PATH")) != NULL) {
+		if (lstat(path, &sb) != 0)
+			errx(1, "TRICKLE_OVERLOAD_PATH (%s): %s", path,
+			    strerror(errno));
+	} else {
+		for (pathp = trypaths; *pathp != NULL; pathp++)
+			if (lstat(*pathp, &sb) == 0)
+				break;
 
-	path = *pathp;
-	if (path == NULL)
-		errx(1, "Could not find overload object");
+		path = *pathp;
+		if (path == NULL)
+			errx(1, "Could not find overload object");
+	}
 
 	if (path[0] != '/') {
 		if (getcwd(buf, sizeof(buf)) == NULL)

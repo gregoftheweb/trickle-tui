@@ -18,6 +18,7 @@
 
 #include <sys/socket.h>
 #include <sys/queue.h>
+#include <sys/stat.h>
 #include <sys/uio.h>
 #include <sys/un.h>
 #ifdef HAVE_SYS_TIME_H
@@ -173,6 +174,267 @@ static void            updatesd(struct sockdesc *, ssize_t, short);
 static void            trickle_init(void);
 void                   safe_printv(int, const char *, ...);
 
+/*
+ * Per-process control socket: lets a live external controller (e.g.
+ * trickle-tui) read and adjust *this* process's own lim[] -- the exact
+ * global array delay() already checks on every I/O call -- without
+ * restarting it. Opt-in and best-effort: if it can't bind (e.g.
+ * /tmp/trickle isn't writable), trickle_control_start() logs once and
+ * trickle carries on exactly as it did before this existed, with
+ * whatever limits it was launched with.
+ *
+ * Protocol: newline-terminated text lines over a Unix domain socket at
+ * /tmp/trickle/<pid>.sock. One client connection at a time, kept open
+ * across multiple commands so a TUI can poll live stats cheaply:
+ *
+ *   GET                      -> "SEND <lim> <rate>\nRECV <lim> <rate>\nOK\n"
+ *   SET SEND <bytes-per-sec> -> "OK\n" or "ERR <reason>\n"
+ *   SET RECV <bytes-per-sec> -> "OK\n" or "ERR <reason>\n"
+ *
+ * There's no dedicated "unlimited" value -- that's the controller's job:
+ * bwstat_getdelay() only throttles once the observed rate exceeds the
+ * configured limit, so setting a limit far above anything the process
+ * can actually push is, in effect, unlimited. (0 is *not* that value --
+ * it means the opposite, maximum throttling; see bwstat_getdelay()'s
+ * `rate <= lim` check.)
+ *
+ * IMPORTANT: every socket/fd operation in this section goes through the
+ * libc_* function pointers (resolved once via dlsym() in trickle_init(),
+ * before this is ever called), never the bare socket()/close()/read()/
+ * write()/accept() names. Those bare names resolve to *this file's own*
+ * overloaded definitions (LD_PRELOAD symbol interposition applies even
+ * to calls from within the preloading library itself) -- calling them
+ * from trickle_control_start(), which runs synchronously from inside
+ * trickle_init() while the thread already holds the non-recursive
+ * global_lock, self-deadlocks the process on the first connection
+ * attempt. Using libc_* directly bypasses trickle's own accounting
+ * entirely, which is also correct: control-channel bytes aren't the
+ * wrapped application's traffic and shouldn't be throttled or counted
+ * against it.
+ */
+#define CONTROL_SOCKDIR "/tmp/trickle"
+#define CONTROL_LINEMAX 256
+
+#ifdef HAVE_PTHREAD
+
+static pthread_t control_thread;
+static int control_listen_sock = -1;
+static char control_sock_path[256];
+
+static void
+control_cleanup_atexit(void)
+{
+	if (control_sock_path[0] != '\0')
+		unlink(control_sock_path);
+}
+
+static void
+control_send(int fd, const char *s)
+{
+	size_t len = strlen(s);
+	size_t pos = 0;
+	ssize_t n;
+
+	while (pos < len) {
+		n = (*libc_write)(fd, s + pos, len - pos);
+		if (n <= 0) {
+			if (n == -1 && (errno == EINTR || errno == EAGAIN))
+				continue;
+			return;
+		}
+		pos += n;
+	}
+}
+
+/* Reads one '\n'-terminated line (stripped) into buf. Returns its length,
+ * or -1 on EOF/error with nothing left to process. */
+static int
+control_readline(int fd, char *buf, size_t bufsz)
+{
+	size_t pos = 0;
+	char c;
+	ssize_t n;
+
+	while (pos + 1 < bufsz) {
+		n = (*libc_read)(fd, &c, 1);
+		if (n == 0)
+			return (pos > 0 ? (int)pos : -1);
+		if (n == -1) {
+			if (errno == EINTR)
+				continue;
+			return (-1);
+		}
+		if (c == '\n')
+			break;
+		buf[pos++] = c;
+	}
+	buf[pos] = '\0';
+	return ((int)pos);
+}
+
+static void
+control_handle_command(int fd, char *line)
+{
+	char reply[256];
+	char *saveptr, *cmd, *dir, *valstr;
+	uint *target;
+	long val;
+
+	cmd = strtok_r(line, " ", &saveptr);
+	if (cmd == NULL) {
+		control_send(fd, "ERR empty command\n");
+		return;
+	}
+
+	if (strcmp(cmd, "GET") == 0) {
+		trickle_lock();
+		snprintf(reply, sizeof(reply),
+		    "SEND %u %u\nRECV %u %u\nOK\n",
+		    lim[TRICKLE_SEND],
+		    bwstat_gettot()->data[TRICKLE_SEND].winrate,
+		    lim[TRICKLE_RECV],
+		    bwstat_gettot()->data[TRICKLE_RECV].winrate);
+		trickle_unlock();
+		control_send(fd, reply);
+		return;
+	}
+
+	if (strcmp(cmd, "SET") == 0) {
+		dir = strtok_r(NULL, " ", &saveptr);
+		valstr = strtok_r(NULL, " ", &saveptr);
+
+		if (dir == NULL || valstr == NULL) {
+			control_send(fd,
+			    "ERR usage: SET SEND|RECV <bytes-per-sec>\n");
+			return;
+		}
+
+		if (strcmp(dir, "SEND") == 0)
+			target = &lim[TRICKLE_SEND];
+		else if (strcmp(dir, "RECV") == 0)
+			target = &lim[TRICKLE_RECV];
+		else {
+			control_send(fd,
+			    "ERR unknown direction (want SEND or RECV)\n");
+			return;
+		}
+
+		errno = 0;
+		val = strtol(valstr, NULL, 10);
+		if (errno != 0 || val < 0 || val > UINT_MAX) {
+			control_send(fd, "ERR invalid limit value\n");
+			return;
+		}
+
+		trickle_lock();
+		*target = (uint)val;
+		trickle_unlock();
+
+		safe_printv(1, "[trickle] control: set %s limit to %ld B/s",
+		    dir, val);
+		control_send(fd, "OK\n");
+		return;
+	}
+
+	control_send(fd, "ERR unknown command\n");
+}
+
+static void *
+control_thread_main(void *arg)
+{
+	char line[CONTROL_LINEMAX];
+	int cfd;
+	int n;
+
+	(void)arg;
+
+	for (;;) {
+		cfd = (*libc_accept)(control_listen_sock, NULL, NULL);
+		if (cfd == -1) {
+			if (errno == EINTR)
+				continue;
+			break; /* listening socket closed or broken */
+		}
+
+		for (;;) {
+			n = control_readline(cfd, line, sizeof(line));
+			if (n < 0)
+				break; /* client disconnected */
+			control_handle_command(cfd, line);
+		}
+
+		(*libc_close)(cfd);
+	}
+
+	return (NULL);
+}
+
+static void
+trickle_control_start(void)
+{
+	struct sockaddr_un addr;
+	char path[sizeof(addr.sun_path)];
+
+	if (mkdir(CONTROL_SOCKDIR, 0755) == -1 && errno != EEXIST) {
+		safe_printv(1, "[trickle] control: mkdir %s failed (%s); "
+		    "live control disabled", CONTROL_SOCKDIR, strerror(errno));
+		return;
+	}
+
+	snprintf(path, sizeof(path), "%s/%ld.sock", CONTROL_SOCKDIR,
+	    (long)getpid());
+	unlink(path); /* stale socket from a prior run with a recycled pid */
+
+	control_listen_sock = (*libc_socket)(AF_UNIX, SOCK_STREAM, 0);
+	if (control_listen_sock == -1) {
+		safe_printv(1, "[trickle] control: socket() failed (%s); "
+		    "live control disabled", strerror(errno));
+		return;
+	}
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sun_family = AF_UNIX;
+	strlcpy(addr.sun_path, path, sizeof(addr.sun_path));
+
+	if (bind(control_listen_sock, (struct sockaddr *)&addr,
+	    sizeof(addr)) == -1 || listen(control_listen_sock, 1) == -1) {
+		safe_printv(1, "[trickle] control: bind/listen on %s failed "
+		    "(%s); live control disabled", path, strerror(errno));
+		(*libc_close)(control_listen_sock);
+		control_listen_sock = -1;
+		return;
+	}
+
+	strlcpy(control_sock_path, path, sizeof(control_sock_path));
+	atexit(control_cleanup_atexit);
+
+	if (pthread_create(&control_thread, NULL, control_thread_main,
+	    NULL) != 0) {
+		safe_printv(1, "[trickle] control: failed to start control "
+		    "thread; live control disabled");
+		(*libc_close)(control_listen_sock);
+		unlink(path);
+		control_sock_path[0] = '\0';
+		control_listen_sock = -1;
+		return;
+	}
+
+	pthread_detach(control_thread);
+
+	safe_printv(1, "[trickle] control: listening on %s", path);
+}
+
+#else /* !HAVE_PTHREAD */
+
+static void
+trickle_control_start(void)
+{
+	safe_printv(1, "[trickle] control: built without thread support; "
+	    "live control disabled");
+}
+
+#endif /* HAVE_PTHREAD */
+
 #define errx(l, fmt, arg...) do {		\
 	safe_printv(0, fmt, ##arg);		\
 	exit(l);				\
@@ -303,6 +565,8 @@ trickle_init(void)
 	trickled_open(&trickled);
 
 	bwstat_init(winsz);
+
+	trickle_control_start();
 
 	safe_printv(1, "[trickle] Initialized");
 

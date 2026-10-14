@@ -182,6 +182,46 @@ impl Session {
         Ok((status, final_stats))
     }
 
+    /// Same contract and shape as launch_interactive, for targets LD_PRELOAD
+    /// can't touch (statically linked -- see ThrottleProxy's doc comment).
+    /// Starts a ThrottleProxy under trickle, runs `command` as a plain
+    /// process pointed at it via HTTPS_PROXY, and polls the *proxy's*
+    /// control socket in the background instead of the target's own (it
+    /// doesn't have one) -- everything else about the caller's experience
+    /// is identical.
+    pub fn launch_interactive_via_proxy(
+        trickle_path: &str,
+        proxy_bin_path: &str,
+        upload_bps: u32,
+        download_bps: u32,
+        command: &str,
+        args: &[String],
+    ) -> std::io::Result<(ExitStatus, Option<Stats>)> {
+        let (mut child, mut proxy) = start_via_proxy(
+            trickle_path,
+            proxy_bin_path,
+            upload_bps,
+            download_bps,
+            command,
+            args,
+            true,
+        )?;
+
+        let proxy_pid = proxy.pid;
+        let child_exited = Arc::new(AtomicBool::new(false));
+        let poller = {
+            let child_exited = Arc::clone(&child_exited);
+            std::thread::spawn(move || poll_session_stats(proxy_pid, child_exited))
+        };
+
+        let status = child.wait()?;
+        child_exited.store(true, Ordering::Relaxed);
+        let final_stats = poller.join().unwrap_or(None);
+
+        let _ = proxy.kill();
+        Ok((status, final_stats))
+    }
+
     /// True once the wrapped process has exited.
     pub fn has_exited(&mut self) -> std::io::Result<bool> {
         Ok(self.child.try_wait()?.is_some())
@@ -252,6 +292,279 @@ impl Session {
     }
 }
 
+/// A local HTTP CONNECT proxy (see src/bin/throttle-proxy.rs), launched
+/// under trickle the same way any other app is. Exists for targets LD_PRELOAD
+/// can't touch at all -- statically linked binaries, confirmed (empirically,
+/// by pointing HTTPS_PROXY at a dead port and watching codex hang instead of
+/// going direct) to be the case for at least one real target this project
+/// cares about. Routes the target's traffic through this process instead,
+/// which *is* a normal dynamically-linked binary trickle can throttle like
+/// anything else -- the target's own linkage stops mattering.
+pub struct ThrottleProxy {
+    child: Child,
+    pub pid: u32,
+    pub port: u16,
+    socket_path: PathBuf,
+}
+
+/// How long to wait for the proxy to report its listening port before
+/// giving up -- it's a tiny local process binding 127.0.0.1:0, this should
+/// never take more than a few milliseconds in practice.
+const PROXY_START_TIMEOUT: Duration = Duration::from_secs(5);
+
+impl ThrottleProxy {
+    /// `proxy_bin_path` is throttle-proxy's own path -- see
+    /// `sibling_binary_path()`, which finds it next to trickle-tui's own
+    /// executable (same cargo target dir, since it's a second `[[bin]]` in
+    /// this same crate).
+    pub fn start(
+        trickle_path: &str,
+        proxy_bin_path: &str,
+        upload_bps: u32,
+        download_bps: u32,
+    ) -> std::io::Result<Self> {
+        let overload_path = resolve_overload_path(trickle_path)?;
+
+        let mut cmd = Command::new(trickle_path);
+        cmd.env("TRICKLE_OVERLOAD_PATH", &overload_path)
+            .arg("-s")
+            .arg("-u")
+            .arg((upload_bps / 1024).max(1).to_string())
+            .arg("-d")
+            .arg((download_bps / 1024).max(1).to_string())
+            .arg(proxy_bin_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+        let mut child = cmd.spawn()?;
+        let pid = child.id();
+        let stdout = child.stdout.take().expect("just set to piped");
+
+        // Reads throttle-proxy's one-line "LISTENING <port>" announcement
+        // off a background thread, bounded by PROXY_START_TIMEOUT, rather
+        // than blocking the caller directly on a read() that -- for a
+        // process this simple -- should never actually hang, but shouldn't
+        // be able to wedge the TUI if something's badly wrong either.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            let _ = tx.send(reader.read_line(&mut line).map(|_| line));
+        });
+
+        let port = match rx.recv_timeout(PROXY_START_TIMEOUT) {
+            Ok(Ok(line)) => line
+                .trim()
+                .strip_prefix("LISTENING ")
+                .and_then(|p| p.parse::<u16>().ok())
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("proxy's startup line didn't parse: {line:?}"),
+                    )
+                })?,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                let _ = child.kill();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timed out waiting for proxy to report its listening port",
+                ));
+            }
+        };
+
+        // trickle_init() fires on the proxy's very first intercepted libc
+        // call -- its own "LISTENING <port>" println! above, since every
+        // bare write() is overloaded regardless of fd -- so this is
+        // normally instant. Still, don't hand back a ThrottleProxy whose
+        // control socket isn't actually there yet.
+        let socket_path = PathBuf::from(format!("/tmp/trickle/{pid}.sock"));
+        let wait_start = Instant::now();
+        loop {
+            if socket_path.exists() && UnixStream::connect(&socket_path).is_ok() {
+                break;
+            }
+            if wait_start.elapsed() > PROXY_START_TIMEOUT {
+                let _ = child.kill();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "proxy's control socket never came up",
+                ));
+            }
+            std::thread::sleep(SOCKET_POLL_INTERVAL);
+        }
+
+        Ok(ThrottleProxy {
+            child,
+            pid,
+            port,
+            socket_path,
+        })
+    }
+
+    pub fn url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    /// One-shot GET against the proxy's control socket -- unlike Session,
+    /// there's no persistent connection here, since callers only need an
+    /// occasional snapshot (a live dashboard poll, or a final summary),
+    /// not a tight polling loop.
+    pub fn get_stats(&self) -> std::io::Result<Stats> {
+        let mut stream = UnixStream::connect(&self.socket_path)?;
+        control_get_stats(&mut stream)
+    }
+
+    pub fn kill(&mut self) -> std::io::Result<()> {
+        self.child.kill()
+    }
+}
+
+/// Spawns `command` as a plain (un-trickled) process with the proxy's URL
+/// set as its HTTP(S)_PROXY -- lowercase and uppercase, since different
+/// HTTP client libraries check different casings by convention. Trickling
+/// the target itself here would be pointless (if it respects the proxy
+/// setting at all, that's because its own HTTP client is doing the actual
+/// socket work somewhere LD_PRELOAD can't see, same as the direct case) and
+/// for a dynamically-linked target would double up the throttling, so this
+/// is deliberately a bare spawn.
+fn spawn_via_proxy(
+    proxy: &ThrottleProxy,
+    command: &str,
+    args: &[String],
+    interactive: bool,
+) -> std::io::Result<Child> {
+    let proxy_url = proxy.url();
+    let mut cmd = Command::new(command);
+    cmd.args(args)
+        .env("HTTPS_PROXY", &proxy_url)
+        .env("https_proxy", &proxy_url)
+        .env("HTTP_PROXY", &proxy_url)
+        .env("http_proxy", &proxy_url);
+
+    if interactive {
+        cmd.stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+    } else {
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+    }
+
+    cmd.spawn()
+}
+
+/// Starts a ThrottleProxy and spawns `command` through it in one step,
+/// cleaning up the proxy if the spawn itself fails. The shared setup behind
+/// both launch_interactive_via_proxy (which also blocks on the child and
+/// polls stats in the background) and dashboard mode's proxy path (which
+/// instead hands the pieces straight to a StatsSource::Proxied and lets the
+/// normal poll_running() loop handle it).
+pub fn start_via_proxy(
+    trickle_path: &str,
+    proxy_bin_path: &str,
+    upload_bps: u32,
+    download_bps: u32,
+    command: &str,
+    args: &[String],
+    interactive: bool,
+) -> std::io::Result<(Child, ThrottleProxy)> {
+    let mut proxy = ThrottleProxy::start(trickle_path, proxy_bin_path, upload_bps, download_bps)?;
+
+    match spawn_via_proxy(&proxy, command, args, interactive) {
+        Ok(child) => Ok((child, proxy)),
+        Err(e) => {
+            let _ = proxy.kill();
+            Err(e)
+        }
+    }
+}
+
+/// Where a running session's stats and limit control actually come from:
+/// either the target's own control socket (Direct, the LD_PRELOAD path), or
+/// a ThrottleProxy's, standing in for a target that can't be trickled
+/// directly. Unifies the two so the rest of the app (dashboard polling,
+/// arrow-key limit adjustment) doesn't need to care which one it's talking
+/// to.
+pub enum StatsSource {
+    Direct(Session),
+    Proxied { child: Child, proxy: ThrottleProxy },
+}
+
+impl StatsSource {
+    pub fn pid(&self) -> u32 {
+        match self {
+            StatsSource::Direct(s) => s.pid,
+            StatsSource::Proxied { proxy, .. } => proxy.pid,
+        }
+    }
+
+    pub fn has_exited(&mut self) -> std::io::Result<bool> {
+        match self {
+            StatsSource::Direct(s) => s.has_exited(),
+            StatsSource::Proxied { child, .. } => Ok(child.try_wait()?.is_some()),
+        }
+    }
+
+    pub fn get_stats(&mut self) -> std::io::Result<Stats> {
+        match self {
+            StatsSource::Direct(s) => s.get_stats(),
+            StatsSource::Proxied { proxy, .. } => proxy.get_stats(),
+        }
+    }
+
+    pub fn set_limit(&mut self, dir: Direction, bytes_per_sec: u32) -> std::io::Result<()> {
+        match self {
+            StatsSource::Direct(s) => s.set_limit(dir, bytes_per_sec),
+            StatsSource::Proxied { proxy, .. } => {
+                let mut stream = UnixStream::connect(&proxy.socket_path)?;
+                let resp = control_send_line(
+                    &mut stream,
+                    &format!("SET {} {}", dir.as_proto_str(), bytes_per_sec),
+                )?;
+                if resp.trim_end() == "OK" {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("proxy rejected SET: {}", resp.trim_end()),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Kills the target. For Proxied, also kills the proxy itself -- it has
+    /// no reason to keep running once nothing's using it, and leaving it
+    /// behind would just leak a process and a control socket.
+    pub fn kill(&mut self) -> std::io::Result<()> {
+        match self {
+            StatsSource::Direct(s) => s.kill(),
+            StatsSource::Proxied { child, proxy } => {
+                let _ = child.kill();
+                proxy.kill()
+            }
+        }
+    }
+}
+
+/// Finds a binary expected to live alongside trickle-tui's own executable
+/// in the same cargo target directory (debug or release, whichever this
+/// process itself was built/run as) -- used to locate throttle-proxy
+/// without the caller needing to know or configure a path for it.
+pub fn sibling_binary_path(name: &str) -> std::io::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    let dir = exe.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "couldn't determine trickle-tui's own directory",
+        )
+    })?;
+    Ok(dir.join(name))
+}
+
 /// Sends one line over an already-connected control socket and reads back
 /// its response. The protocol's responses are all terminated by a line
 /// that's either "OK" or starts with "ERR"; GET sends two data lines first.
@@ -316,6 +629,16 @@ fn poll_session_stats(pid: u32, exited: Arc<AtomicBool>) -> Option<Stats> {
         match control_get_stats(&mut stream) {
             Ok(stats) => last_stats = Some(stats),
             Err(_) => break,
+        }
+        // For a Direct-mode target, its own control socket normally dies
+        // with it, so the next GET above would already fail on its own.
+        // But `pid` here can also be a ThrottleProxy's -- which stays alive
+        // (and keeps answering GET perfectly happily) after the *target*
+        // it was relaying for has exited -- so this loop needs its own way
+        // to know to stop. Without this check it polls a perfectly healthy
+        // socket forever, and the caller's poller.join() never returns.
+        if exited.load(Ordering::Relaxed) {
+            break;
         }
         std::thread::sleep(STATS_POLL_INTERVAL);
     }

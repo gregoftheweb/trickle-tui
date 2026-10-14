@@ -1,7 +1,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Sparkline};
 
-use crate::app::{App, LauncherField, Screen};
+use crate::app::{App, LauncherField, ProxyRouting, Screen};
 
 pub fn draw(frame: &mut Frame, app: &App) {
     match app.screen {
@@ -30,6 +30,7 @@ fn draw_launcher(frame: &mut Frame, app: &App) {
         .constraints([
             Constraint::Length(3), // title
             Constraint::Length(3), // interactive toggle
+            Constraint::Length(3), // routing toggle
             Constraint::Length(3), // command
             Constraint::Length(3), // upload
             Constraint::Length(3), // download
@@ -64,11 +65,26 @@ fn draw_launcher(frame: &mut Frame, app: &App) {
     );
     frame.render_widget(
         labeled_value(
+            "Routing? (space to toggle)",
+            match f.routing {
+                ProxyRouting::Direct => {
+                    "direct (LD_PRELOAD -- works for most things, not static binaries)"
+                }
+                ProxyRouting::Proxy => {
+                    "via local proxy (HTTPS_PROXY -- for static binaries, e.g. codex)"
+                }
+            },
+            f.focus == LauncherField::Routing,
+        ),
+        chunks[2],
+    );
+    frame.render_widget(
+        labeled_value(
             "Command (e.g. `claude`, `codex`, `vivaldi`)",
             &f.command,
             f.focus == LauncherField::Command,
         ),
-        chunks[2],
+        chunks[3],
     );
     frame.render_widget(
         labeled_value(
@@ -76,7 +92,7 @@ fn draw_launcher(frame: &mut Frame, app: &App) {
             &f.upload_limit_kbps,
             f.focus == LauncherField::UploadLimit,
         ),
-        chunks[3],
+        chunks[4],
     );
     frame.render_widget(
         labeled_value(
@@ -84,7 +100,7 @@ fn draw_launcher(frame: &mut Frame, app: &App) {
             &f.download_limit_kbps,
             f.focus == LauncherField::DownloadLimit,
         ),
-        chunks[4],
+        chunks[5],
     );
     frame.render_widget(
         labeled_value(
@@ -92,7 +108,7 @@ fn draw_launcher(frame: &mut Frame, app: &App) {
             if f.timed { "yes" } else { "no (permanent)" },
             f.focus == LauncherField::Timed,
         ),
-        chunks[5],
+        chunks[6],
     );
     if f.timed {
         frame.render_widget(
@@ -101,19 +117,19 @@ fn draw_launcher(frame: &mut Frame, app: &App) {
                 &f.duration_minutes,
                 f.focus == LauncherField::DurationMinutes,
             ),
-            chunks[6],
+            chunks[7],
         );
     }
 
     if let Some(err) = &f.error {
         frame.render_widget(
             Paragraph::new(err.as_str()).style(Style::default().fg(Color::Red)),
-            chunks[7],
+            chunks[8],
         );
     } else if let Some(status) = &f.status {
         frame.render_widget(
             Paragraph::new(status.as_str()).style(Style::default().fg(Color::Green)),
-            chunks[7],
+            chunks[8],
         );
     }
 
@@ -122,7 +138,7 @@ fn draw_launcher(frame: &mut Frame, app: &App) {
             "Tab/Shift+Tab: move  Space: toggle  Enter: launch  Esc/Ctrl+C: quit",
         )
         .style(Style::default().fg(Color::DarkGray)),
-        chunks[8],
+        chunks[9],
     );
 }
 
@@ -182,7 +198,7 @@ fn draw_running(frame: &mut Frame, app: &App) {
     frame.render_widget(
         Paragraph::new(format!(
             "{}  (pid {}){}{}",
-            running.command_label, running.session.pid, timer_label, exited_label
+            running.command_label, running.source.pid(), timer_label, exited_label
         ))
         .style(
             Style::default()

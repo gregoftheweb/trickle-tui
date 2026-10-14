@@ -293,7 +293,24 @@ control_handle_command(int fd, char *line)
 	}
 
 	if (strcmp(cmd, "GET") == 0) {
-		trickle_lock();
+		/*
+		 * Deliberately lock-free: lim[] is a pair of uints, and
+		 * bwstat_gettot() just hands back a pointer to the (always
+		 * valid, allocated once at init -- see bwstat_gettot()) totals
+		 * entry; reading native-word fields off it needs no lock for
+		 * memory safety on any platform this runs on. The tradeoff is
+		 * a possible torn snapshot across fields a few microseconds
+		 * apart, which is fine for a stats readout.
+		 *
+		 * This matters beyond style: a busy session can hold
+		 * trickle_lock() very frequently (every intercepted I/O call
+		 * takes it, if only briefly). Under a non-fair pthread mutex,
+		 * many threads cycling through it fast enough can starve out
+		 * a comparatively rare GET for a long time -- empirically,
+		 * indefinitely for the control socket's whole session, not a
+		 * one-off hiccup. SET still locks (it's rare, and writing
+		 * lim[] benefits from not racing with itself).
+		 */
 		snprintf(reply, sizeof(reply),
 		    "SEND %u %u %u\nRECV %u %u %u\nOK\n",
 		    lim[TRICKLE_SEND],
@@ -302,7 +319,6 @@ control_handle_command(int fd, char *line)
 		    lim[TRICKLE_RECV],
 		    bwstat_gettot()->data[TRICKLE_RECV].winrate,
 		    bwstat_gettot()->data[TRICKLE_RECV].bytes);
-		trickle_unlock();
 		control_send(fd, reply);
 		return;
 	}
@@ -1425,8 +1441,22 @@ delay(int sock, size_t *len, short which)
 		if (ISSET(sd->flags, TRICKLE_NONBLOCK))
 			return (TRICKLE_WOULDBLOCK);
 
+		/*
+		 * Every caller of delay() holds trickle_lock() across this
+		 * whole call (it's not their own lock to drop -- delay() took
+		 * it on, so delay() gives it back). Release it for the sleep
+		 * itself: ts/rm are on-stack, nothing here touches shared
+		 * state. Holding a single process-wide lock across what can
+		 * be a long intentional throttling sleep starves out every
+		 * other thread's own I/O *and* the control socket's GET,
+		 * which needs this same lock just to report current rates --
+		 * a busy, heavily-throttled session could leave the control
+		 * thread unable to get a word in for its entire run.
+		 */
+		trickle_unlock();
 		while (nanosleep(&ts, &rm) == -1 && errno == EINTR)
 			ts = rm;
+		trickle_lock();
 	}
 
 	return (0);
